@@ -120,7 +120,11 @@ RUN /app/kubechecks help
 
 USER kubechecks
 
-CMD ["/app/kubechecks", "controller"]
+# medgrupo: ENTRYPOINT (a stage production upstream so tem CMD; a release e feita
+# por goreleaser que poe o entrypoint). Com ENTRYPOINT, args:["controller"] do
+# chart vira /app/kubechecks controller — drop-in da imagem zapier.
+ENTRYPOINT ["/app/kubechecks"]
+CMD ["controller"]
 
 # ============================================================================
 # Stage: debug
