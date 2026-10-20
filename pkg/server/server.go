@@ -131,6 +131,24 @@ func (s *Server) hooksPrefix() string {
 	return strings.TrimSuffix(serverUrl, "/")
 }
 
+// repoHostedOnVcs reports whether repo (a clone URL from the VcsToArgoMap) lives
+// on the VCS this instance talks to. The map also holds Helm/OCI chart
+// registries and, for ApplicationSets, un-rendered template URLs such as
+// "{{ .chart.repoURL }}"; asking the VCS API about those is at best a 404 and,
+// for the templated ones, a panic inside the GitHub client's parseRepo that
+// takes the whole process down at boot (medgrupo, 2026-10-20).
+func repoHostedOnVcs(repo, vcsBaseUrl string) bool {
+	u, err := url.Parse(repo)
+	if err != nil || u.Host == "" || strings.Contains(u.Path, "{{") {
+		return false
+	}
+	base, err := url.Parse(vcsBaseUrl)
+	if err != nil || base.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, base.Host)
+}
+
 func (s *Server) ensureWebhooks(ctx context.Context) error {
 	if !s.ctr.Config.EnsureWebhooks {
 		return nil
@@ -157,6 +175,11 @@ func (s *Server) ensureWebhooks(ctx context.Context) error {
 	log.Info().Str("webhookUrl", fullUrl).Msg("webhook URL for this kubechecks instance")
 
 	for _, repo := range s.ctr.VcsToArgoMap.GetVcsRepos() {
+		if !repoHostedOnVcs(repo, s.ctr.Config.VcsBaseUrl) {
+			log.Debug().Str("repo", repo).Msg("skipping webhook: repo is not hosted on the configured VCS")
+			continue
+		}
+
 		wh, err := vcsClient.GetHookByUrl(ctx, repo, fullUrl)
 		if err != nil && !errors.Is(err, vcs.ErrHookNotFound) {
 			log.Error().Err(err).Msgf("failed to get hook for %s:", repo)
