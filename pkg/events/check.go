@@ -142,6 +142,59 @@ func (ce *CheckEvent) UpdateListOfChangedFiles(ctx context.Context, repo *git.Re
 type MatcherFn func(ce *CheckEvent, repo *git.Repo) error
 
 // GenerateListOfAffectedApps walks the repo to find any apps or appsets impacted by the changes in the MR/PR.
+// dropForeignAppSets removes ApplicationSets whose metadata.namespace is not
+// watched by this instance. The matcher picks up ANY changed file containing
+// "kind: ApplicationSet"; in a repo that also holds the ApplicationSets of
+// another Argo CD instance, generating their apps only yields one error block
+// per app, because their AppProjects do not exist here (86 of them on
+// medgrupo's gitops-platform#1420, 2026-10-20).
+func (ce *CheckEvent) dropForeignAppSets(appSets []v1alpha1.ApplicationSet) []v1alpha1.ApplicationSet {
+	kept := appSets[:0]
+	for _, appSet := range appSets {
+		if !ce.ctr.Config.AllowsAppNamespace(appSet.Namespace) {
+			ce.logger.Info().Str("appset", appSet.Name).Str("namespace", appSet.Namespace).
+				Msg("skipping ApplicationSet of another Argo CD instance (namespace not watched)")
+			continue
+		}
+		kept = append(kept, appSet)
+	}
+	return kept
+}
+
+// dropAppsOfUnknownProjects removes generated apps whose AppProject does not
+// exist in this Argo CD instance (same symptom as above when the
+// ApplicationSet carries no namespace). Lookups are cached per project; an
+// API error keeps the app, preserving the previous behaviour.
+func (ce *CheckEvent) dropAppsOfUnknownProjects(ctx context.Context, apps []v1alpha1.Application) []v1alpha1.Application {
+	if ce.ctr.ArgoClient == nil {
+		return apps
+	}
+
+	known := map[string]bool{}
+	kept := apps[:0]
+	for _, app := range apps {
+		exists, cached := known[app.Spec.Project]
+		if !cached {
+			var err error
+			exists, err = ce.ctr.ArgoClient.ProjectExists(ctx, app.Spec.Project)
+			if err != nil {
+				ce.logger.Warn().Err(err).Str("project", app.Spec.Project).Msg("could not check AppProject; keeping app")
+				exists = true
+			}
+			known[app.Spec.Project] = exists
+			if !exists {
+				ce.logger.Info().Str("project", app.Spec.Project).
+					Msg("skipping apps of an AppProject that does not exist in this Argo CD instance")
+			}
+		}
+		if !exists {
+			continue
+		}
+		kept = append(kept, app)
+	}
+	return kept
+}
+
 func (ce *CheckEvent) GenerateListOfAffectedApps(ctx context.Context, repo *git.Repo, targetBranch string, initMatcherFn MatcherFn) error {
 	_, span := tracer.Start(ctx, "GenerateListOfAffectedApps")
 	defer span.End()
@@ -159,12 +212,14 @@ func (ce *CheckEvent) GenerateListOfAffectedApps(ctx context.Context, repo *git.
 		telemetry.SetError(span, err, "Get Affected Apps")
 		ce.logger.Error().Caller().Err(err).Msg("could not get list of affected apps and appsets")
 	}
+	ce.affectedItems.ApplicationSets = ce.dropForeignAppSets(ce.affectedItems.ApplicationSets)
 	for _, appSet := range ce.affectedItems.ApplicationSets {
 		apps, err := ce.generator.GenerateApplicationSetApps(ctx, appSet, &ce.ctr)
 		if err != nil {
 			ce.logger.Error().Caller().Err(err).Msg("could not generate apps from appSet")
 			continue
 		}
+		apps = ce.dropAppsOfUnknownProjects(ctx, apps)
 
 		// Build a set of appset-generated app names for fast lookup.
 		generatedNames := make(map[string]struct{}, len(apps))
