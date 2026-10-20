@@ -223,3 +223,21 @@ func TestRemoveFromSlice(t *testing.T) {
 	t.Run("Strings", stringsTest)
 	// Add more subtests for different generic types if necessary
 }
+
+// medgrupo patch: a multi-source app whose FIRST source is a versioned Helm
+// chart and whose values live in a git ref source ($values) must be included
+// when the PR targets the git source's branch — and only then.
+func TestShouldIncludeMultiSource(t *testing.T) {
+	app := v1alpha1.Application{
+		Spec: v1alpha1.ApplicationSpec{
+			Sources: v1alpha1.ApplicationSources{
+				{RepoURL: "oci://charts.example.com", Chart: "app", TargetRevision: "0.5.13"},
+				{RepoURL: "https://github.com/org/app.git", Ref: "values", TargetRevision: "main"},
+			},
+		},
+	}
+
+	assert.True(t, shouldInclude(app, "main"), "git source branch matches the PR target")
+	assert.False(t, shouldInclude(app, "homol"), "neither the chart version nor the git branch matches")
+	assert.False(t, shouldInclude(app, "0.5.13"), "a chart version is not a branch")
+}
