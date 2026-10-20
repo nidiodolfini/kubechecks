@@ -240,6 +240,12 @@ func (a *ArgoClient) generateManifestForExternalChart(ctx context.Context, app v
 		ProjectSourceRepos: proj.Spec.SourceRepos,
 		HasMultipleSources: app.Spec.HasMultipleSources(),
 		RefSources:         refSources,
+		// The ref sources point at the PR branch, which may have been pushed
+		// seconds ago: the repo-server's cached `git ls-remote` (revision cache,
+		// 3m by default) does not know it yet and answers "unable to resolve
+		// '<branch>' to a commit SHA"; a new push inside the window would
+		// silently render the previous SHA. PR checks must always see live refs.
+		NoRevisionCache: true,
 	}
 
 	repoClient, conn, err := a.createRepoServerClient()
@@ -406,6 +412,12 @@ func (a *ArgoClient) generateManifests(ctx context.Context, app v1alpha1.Applica
 		ProjectSourceRepos: proj.Spec.SourceRepos,
 		HasMultipleSources: app.Spec.HasMultipleSources(),
 		RefSources:         refSources,
+		// The ref sources point at the PR branch, which may have been pushed
+		// seconds ago: the repo-server's cached `git ls-remote` (revision cache,
+		// 3m by default) does not know it yet and answers "unable to resolve
+		// '<branch>' to a commit SHA"; a new push inside the window would
+		// silently render the previous SHA. PR checks must always see live refs.
+		NoRevisionCache: true,
 	}
 
 	// creating a new client forces grpc to create a new connection, which causes
