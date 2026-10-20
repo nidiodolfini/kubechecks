@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	appv1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
@@ -30,6 +31,12 @@ type ApplicationWatcher struct {
 	appLister            applisters.ApplicationLister
 
 	vcsToArgoMap appdir.VcsToArgoMap
+
+	// ctr gives access to the VCS client and config so that repos of
+	// Applications created after boot get their webhook without a restart.
+	ctr container.Container
+	// hooked remembers repos already confirmed to have our webhook (per process).
+	hooked sync.Map
 }
 
 // NewApplicationWatcher creates a new instance of ApplicationWatcher.
@@ -44,6 +51,7 @@ func NewApplicationWatcher(ctr container.Container, ctx context.Context) (*Appli
 	ctrl := ApplicationWatcher{
 		applicationClientset: appclientset.NewForConfigOrDie(ctr.KubeClientSet.Config()),
 		vcsToArgoMap:         ctr.VcsToArgoMap,
+		ctr:                  ctr,
 	}
 
 	appInformer, appLister := ctrl.newApplicationInformerAndLister(time.Second*30, ctr.Config, ctx)
@@ -72,7 +80,7 @@ func (ctrl *ApplicationWatcher) Run(ctx context.Context, processors int) {
 
 // onAdd is the function executed when the informer notifies the
 // presence of a new Application in the namespace
-func (ctrl *ApplicationWatcher) onApplicationAdded(obj interface{}) {
+func (ctrl *ApplicationWatcher) onApplicationAdded(obj interface{}, isInInitialList bool) {
 	app, ok := canProcessApp(obj)
 	if !ok {
 		return
@@ -83,6 +91,11 @@ func (ctrl *ApplicationWatcher) onApplicationAdded(obj interface{}) {
 	}
 	log.Info().Str("key", key).Msg("appwatcher: onApplicationAdded")
 	ctrl.vcsToArgoMap.AddApp(app)
+
+	// The initial list is the set server.ensureWebhooks already swept at boot.
+	if !isInInitialList {
+		ctrl.ensureWebhooks(app)
+	}
 }
 
 func (ctrl *ApplicationWatcher) onApplicationUpdated(old, new interface{}) {
@@ -101,6 +114,7 @@ func (ctrl *ApplicationWatcher) onApplicationUpdated(old, new interface{}) {
 	if !reflect.DeepEqual(oldApp.Spec.Source, newApp.Spec.Source) || !reflect.DeepEqual(oldApp.Spec.Sources, newApp.Spec.Sources) {
 		log.Info().Str("key", key).Msg("appwatcher: onApplicationUpdated")
 		ctrl.vcsToArgoMap.UpdateApp(old.(*appv1alpha1.Application), new.(*appv1alpha1.Application))
+		ctrl.ensureWebhooks(newApp)
 	}
 
 }
@@ -172,7 +186,7 @@ func (ctrl *ApplicationWatcher) newApplicationInformerAndLister(refreshTimeout t
 	)
 	lister := applisters.NewApplicationLister(informer.GetIndexer())
 	if _, err := informer.AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
+		cache.ResourceEventHandlerDetailedFuncs{
 			AddFunc:    ctrl.onApplicationAdded,
 			UpdateFunc: ctrl.onApplicationUpdated,
 			DeleteFunc: ctrl.onApplicationDeleted,
@@ -206,4 +220,49 @@ func canProcessApp(obj interface{}) (*appv1alpha1.Application, bool) {
 
 func isGitRepo(url string) bool {
 	return strings.Contains(url, "gitlab.com") || strings.Contains(url, "github.com")
+}
+
+// ensureWebhooks registers this instance's webhook on the git repos of an
+// Application that appeared (or changed sources) after boot. Boot-time repos
+// are covered by server.ensureWebhooks; without this, a repo onboarded while
+// kubechecks was running (new app in the catalog) only got its hook on the
+// next restart (medgrupo, 2026-10-20).
+func (ctrl *ApplicationWatcher) ensureWebhooks(app *appv1alpha1.Application) {
+	if !ctrl.ctr.Config.EnsureWebhooks || ctrl.ctr.VcsClient == nil {
+		return
+	}
+
+	for _, repo := range gitRepoURLs(app) {
+		if _, done := ctrl.hooked.Load(repo); done {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		created, err := ctrl.ctr.EnsureRepoWebhook(ctx, repo)
+		cancel()
+		if err != nil {
+			log.Warn().Err(err).Str("repo", repo).Str("app", app.Name).Msg("appwatcher: failed to ensure webhook")
+			continue
+		}
+
+		ctrl.hooked.Store(repo, struct{}{})
+		if created {
+			log.Info().Str("repo", repo).Str("app", app.Name).Msg("appwatcher: webhook created for repo of new application")
+		}
+	}
+}
+
+// gitRepoURLs lists the git (non chart registry) repo URLs of an Application,
+// single-source or multi-source.
+func gitRepoURLs(app *appv1alpha1.Application) []string {
+	var out []string
+	if src := app.Spec.Source; src != nil && isGitRepo(src.RepoURL) {
+		out = append(out, src.RepoURL)
+	}
+	for _, src := range app.Spec.Sources {
+		if isGitRepo(src.RepoURL) {
+			out = append(out, src.RepoURL)
+		}
+	}
+	return out
 }

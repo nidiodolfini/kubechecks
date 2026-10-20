@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/url"
-	"strings"
 
 	"github.com/heptiolabs/healthcheck"
 	"github.com/labstack/echo-contrib/echoprometheus"
@@ -18,10 +16,9 @@ import (
 	"github.com/zapier/kubechecks/pkg/checks"
 	"github.com/zapier/kubechecks/pkg/container"
 	"github.com/zapier/kubechecks/pkg/queue"
-	"github.com/zapier/kubechecks/pkg/vcs"
 )
 
-const KubeChecksHooksPathPrefix = "/hooks"
+const KubeChecksHooksPathPrefix = container.HooksPathPrefix
 
 type Server struct {
 	ctr             container.Container
@@ -122,33 +119,12 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) hooksPrefix() string {
-	prefix := s.ctr.Config.UrlPrefix
-	serverUrl, err := url.JoinPath("/", prefix, KubeChecksHooksPathPrefix)
-	if err != nil {
-		log.Warn().Err(err).Msg(":whatintarnation:")
-	}
-
-	return strings.TrimSuffix(serverUrl, "/")
+	return s.ctr.HooksPrefix()
 }
 
-// repoHostedOnVcs reports whether repo (a clone URL from the VcsToArgoMap) lives
-// on the VCS this instance talks to. The map also holds Helm/OCI chart
-// registries and, for ApplicationSets, un-rendered template URLs such as
-// "{{ .chart.repoURL }}"; asking the VCS API about those is at best a 404 and,
-// for the templated ones, a panic inside the GitHub client's parseRepo that
-// takes the whole process down at boot (medgrupo, 2026-10-20).
-func repoHostedOnVcs(repo, vcsBaseUrl string) bool {
-	u, err := url.Parse(repo)
-	if err != nil || u.Host == "" || strings.Contains(u.Path, "{{") {
-		return false
-	}
-	base, err := url.Parse(vcsBaseUrl)
-	if err != nil || base.Host == "" {
-		return false
-	}
-	return strings.EqualFold(u.Host, base.Host)
-}
-
+// ensureWebhooks registers the webhook on every VCS repo known at boot. Repos
+// that appear later (a new Application) are handled by the app_watcher via the
+// same container.EnsureRepoWebhook.
 func (s *Server) ensureWebhooks(ctx context.Context) error {
 	if !s.ctr.Config.EnsureWebhooks {
 		return nil
@@ -158,38 +134,20 @@ func (s *Server) ensureWebhooks(ctx context.Context) error {
 		return errors.New("must enable 'monitor-all-applications' to create webhooks")
 	}
 
-	urlBase := s.ctr.Config.WebhookUrlBase
-	if urlBase == "" {
-		return errors.New("must define 'webhook-url-base' to create webhooks")
-	}
-
-	log.Info().Msg("ensuring all webhooks are created correctly")
-
-	vcsClient := s.ctr.VcsClient
-
-	fullUrl, err := url.JoinPath(urlBase, s.hooksPrefix(), vcsClient.GetName(), "project")
+	fullUrl, err := s.ctr.WebhookURL()
 	if err != nil {
-		log.Warn().Str("urlBase", urlBase).Msg("failed to create a webhook url")
-		return errors.Wrap(err, "failed to create a webhook url")
+		return err
 	}
-	log.Info().Str("webhookUrl", fullUrl).Msg("webhook URL for this kubechecks instance")
+	log.Info().Str("webhookUrl", fullUrl).Msg("ensuring all webhooks are created correctly")
 
 	for _, repo := range s.ctr.VcsToArgoMap.GetVcsRepos() {
-		if !repoHostedOnVcs(repo, s.ctr.Config.VcsBaseUrl) {
-			log.Debug().Str("repo", repo).Msg("skipping webhook: repo is not hosted on the configured VCS")
+		created, err := s.ctr.EnsureRepoWebhook(ctx, repo)
+		if err != nil {
+			log.Error().Err(err).Str("repo", repo).Msg("failed to ensure webhook")
 			continue
 		}
-
-		wh, err := vcsClient.GetHookByUrl(ctx, repo, fullUrl)
-		if err != nil && !errors.Is(err, vcs.ErrHookNotFound) {
-			log.Error().Err(err).Msgf("failed to get hook for %s:", repo)
-			continue
-		}
-
-		if wh == nil {
-			if err = vcsClient.CreateHook(ctx, repo, fullUrl, s.ctr.Config.WebhookSecret); err != nil {
-				log.Info().Err(err).Msgf("failed to create hook for %s:", repo)
-			}
+		if created {
+			log.Info().Str("repo", repo).Msg("webhook created")
 		}
 	}
 
