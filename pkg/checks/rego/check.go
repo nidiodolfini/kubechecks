@@ -7,12 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/ghodss/yaml"
-	"github.com/olekukonko/tablewriter"
-	"github.com/olekukonko/tablewriter/renderer"
-	"github.com/olekukonko/tablewriter/tw"
 	"github.com/open-policy-agent/conftest/output"
 	"github.com/open-policy-agent/conftest/parser"
 	"github.com/open-policy-agent/conftest/runner"
@@ -213,60 +211,62 @@ func (c *Checker) Check(ctx context.Context, request checks.Request) (msg.Result
 	return cr, nil
 }
 
-// formatConftestResults writes the check results from an array of output.CheckResult objects into a formatted table.
-// The table omits success messages to reduce noise and includes file, message, and status (failed, warning, skipped).
-// The formatted table is then rendered and written to the given io.Writer 'w'.
+// formatConftestResults writes the failed, warned and skipped checks as a
+// Markdown table. The box-drawing table tablewriter used to emit is plain text
+// inside the <details> block, so GitHub/GitLab wrap it into an unreadable wall of
+// lines; a Markdown table renders as a real table. Successes are omitted.
 func formatConftestResults(w io.Writer, checkResults []output.CheckResult, vcs emojiable) error {
-	//table := tablewriter.NewWriter(w)
-	table := tablewriter.NewTable(w,
-		tablewriter.WithRenderer(
-			renderer.NewBlueprint(
-				tw.Rendition{
-					Borders: tw.Border{Left: tw.On, Top: tw.Off, Right: tw.On, Bottom: tw.Off},
-					Settings: tw.Settings{
-						Separators: tw.Separators{BetweenColumns: tw.On},
-						Lines:      tw.Lines{ShowFooterLine: tw.On},
-					},
-				},
-			),
-		),
-		tablewriter.WithConfig(tablewriter.Config{
-			Row: tw.CellConfig{
-				Formatting: tw.CellFormatting{AutoWrap: tw.WrapNone}, // Wrap long content
-				Alignment:  tw.CellAlignment{Global: tw.AlignLeft},   // Left-align rows
-			},
-		}),
-	)
-	table.Header([]string{" ", "file", "message"})
+	var rows []string
+	add := func(state, fileName, message string) {
+		rows = append(rows, fmt.Sprintf("| %s | %s | %s |", state, resourceLabel(fileName), mdCell(message)))
+	}
 
-	var tableData [][]string
 	for _, checkResult := range checkResults {
 		for _, result := range checkResult.Exceptions {
-			tableData = append(tableData, []string{vcs.ToEmoji(pkg.StateError), code(checkResult.FileName), result.Message})
+			add(vcs.ToEmoji(pkg.StateError), checkResult.FileName, result.Message)
 		}
-
 		for _, result := range checkResult.Warnings {
-			tableData = append(tableData, []string{vcs.ToEmoji(pkg.StateWarning), code(checkResult.FileName), result.Message})
+			add(vcs.ToEmoji(pkg.StateWarning), checkResult.FileName, result.Message)
 		}
-
 		for _, result := range checkResult.Skipped {
-			tableData = append(tableData, []string{" :arrow_right:  ", code(checkResult.FileName), result.Message})
+			add(":arrow_right:", checkResult.FileName, result.Message)
 		}
-
 		for _, result := range checkResult.Failures {
-			tableData = append(tableData, []string{vcs.ToEmoji(pkg.StateFailure), code(checkResult.FileName), result.Message})
+			add(vcs.ToEmoji(pkg.StateFailure), checkResult.FileName, result.Message)
 		}
 	}
 
-	if len(tableData) > 0 {
-		if err := table.Bulk(tableData); err != nil {
-			return errors.Wrap(err, "failed to add rows to table")
-		}
-		if err := table.Render(); err != nil {
-			return errors.Wrap(err, "failed to render table")
-		}
+	if len(rows) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintf(w, "| | Resource | Message |\n|---|---|---|\n%s\n", strings.Join(rows, "\n")); err != nil {
+		return errors.Wrap(err, "failed to write table")
 	}
 	return nil
+}
+
+// manifestFileRe matches the file names dumpFiles produces:
+// "namespace=<ns>,kind=<Kind>,name=<name>.yaml" (namespace optional).
+var manifestFileRe = regexp.MustCompile(`^(?:namespace=([^,]*),)?kind=([^,]*),name=(.*)\.yaml$`)
+
+// resourceLabel turns a dumped manifest file name into "Kind `ns/name`";
+// anything else is shown verbatim in code font.
+func resourceLabel(fileName string) string {
+	m := manifestFileRe.FindStringSubmatch(filepath.Base(fileName))
+	if m == nil {
+		return code(fileName)
+	}
+	if m[1] == "" {
+		return fmt.Sprintf("%s %s", m[2], code(m[3]))
+	}
+	return fmt.Sprintf("%s %s", m[2], code(m[1]+"/"+m[3]))
+}
+
+// mdCell makes a message safe for a Markdown table cell.
+func mdCell(s string) string {
+	s = strings.ReplaceAll(s, "|", `\|`)
+	s = strings.ReplaceAll(s, "\r\n", "<br>")
+	return strings.ReplaceAll(s, "\n", "<br>")
 }
 
 func code(s string) string {
