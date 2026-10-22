@@ -272,21 +272,30 @@ func (c *Cache) cleanupStaleArchives() {
 	var removed int
 
 	for key, entry := range c.entries {
-		// Skip if archive is currently in use
-		if atomic.LoadInt32(&entry.refCount) > 0 {
-			continue
-		}
-
-		// Check if archive is stale
+		// medgrupo.7: a idade (lastUsed > TTL) é o único critério. O refCount
+		// NÃO pode vetar a remoção: ninguém chama Release() (Manager.Release não
+		// tem chamador; events/check.go só faz Clone), então toda entrada fica
+		// com refCount >= 1 para sempre e a limpeza nunca apagava nada — disco e
+		// slab do kernel (dentries/inodes das árvores extraídas) cresciam sem
+		// teto até o OOM do pod (hub Management-0226, 22/10/2026). Um archive
+		// sem uso há mais de um TTL (1 h) não está em uso: um check leva
+		// segundos e lastUsed é atualizado a cada acquire.
 		if now.Sub(entry.lastUsed) > c.ttl {
 			log.Info().
 				Str("path", entry.extractedPath).
+				Int32("ref_count", atomic.LoadInt32(&entry.refCount)).
 				Dur("unused_for", now.Sub(entry.lastUsed)).
 				Msg("removing stale archive from cache")
 
 			// Remove from disk
 			if err := os.RemoveAll(entry.extractedPath); err != nil {
 				log.Warn().Err(err).Str("path", entry.extractedPath).Msg("failed to remove archive directory")
+			}
+			// medgrupo.7: extractedPath é <baseDir>/<sha>/<topLevelDir>; o
+			// <sha>/ ficava para trás vazio (um inode/dentry por check). Só o
+			// remove se já estiver vazio — nunca o baseDir.
+			if parent := filepath.Dir(entry.extractedPath); parent != c.baseDir {
+				_ = os.Remove(parent)
 			}
 
 			delete(c.entries, key)
